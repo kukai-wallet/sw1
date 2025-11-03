@@ -1,65 +1,189 @@
-import { DurableObject } from "cloudflare:workers";
-
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
-
-
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
-
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
-}
+import { Routes } from './constants/routes';
+import type { Env, SlackInteractionPayload } from './types';
+import { verifySlackRequest } from './utils/slack/verify-request';
+import { createWalletButtons, openModal } from './utils/slack/post-message';
+import { interpretPrompt } from './utils/openai/interpret';
+import { createWalletWithSDK } from './utils/coinbase/sdk-wallet';
+import {
+	handleCreateWallet,
+	handleGetWallet,
+	handleFundWallet,
+	handleRemoveWallet,
+	handleAIAction,
+} from './handlers/wallet-actions';
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a stub to open a communication channel with the Durable Object
-		// instance named "foo".
-		//
-		// Requests from all Workers to the Durable Object instance named "foo"
-		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance.
-		const greeting = await stub.sayHello("world");
+		// Slack Events (URL verification)
+		if (url.pathname === Routes.SLACK_EVENTS && request.method === 'POST') {
+			const body = await request.text();
+			const payload = JSON.parse(body);
 
-		return new Response(greeting);
+			if (payload.type === 'url_verification') {
+				return new Response(JSON.stringify({ challenge: payload.challenge }), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+
+			return new Response('OK', { status: 200 });
+		}
+
+		// Slack Interactions (Buttons & Modals)
+		if (url.pathname === Routes.SLACK_INTERACTIONS && request.method === 'POST') {
+			if (!(await verifySlackRequest(request, env.SLACK_SIGNING_SECRET))) {
+				return new Response('Unauthorized', { status: 401 });
+			}
+
+			const formData = await request.formData();
+			const payloadStr = formData.get('payload') as string;
+			const payload: SlackInteractionPayload = JSON.parse(payloadStr);
+			const userId = payload.user.id;
+
+			// Handle modal submission (AI Prompt)
+			if (payload.type === 'view_submission') {
+				try {
+					const promptText = payload.view?.state.values.prompt_input.prompt_text.value;
+					if (!promptText) {
+						return new Response(JSON.stringify({
+							response_action: 'errors',
+							errors: { prompt_input: 'Please enter a prompt' },
+						}), {
+							headers: { 'Content-Type': 'application/json' },
+						});
+					}
+
+					const channelId = payload.view?.private_metadata || payload.user.id;
+					const action = await interpretPrompt(promptText, env.OPENAI_API_KEY);
+					await handleAIAction(userId, action, channelId, env);
+
+					return new Response('', { status: 200 });
+				} catch (error) {
+					console.error('Error processing AI prompt:', error);
+					return new Response(JSON.stringify({
+						response_action: 'errors',
+						errors: {
+							prompt_input: error instanceof Error ? error.message : 'Failed to process request',
+						},
+					}), {
+						headers: { 'Content-Type': 'application/json' },
+					});
+				}
+			}
+
+			// Handle button interactions
+			const action = payload.actions?.[0]?.value;
+
+			try {
+				if (action === 'ai_prompt') {
+					const channelId = payload.channel?.id || '';
+					await openModal(payload.trigger_id!, channelId, env.SLACK_BOT_TOKEN);
+					return new Response('', { status: 200 });
+				}
+
+				switch (action) {
+					case 'create_wallet':
+						await handleCreateWallet(userId, env, payload.response_url!);
+						break;
+					case 'get_wallet':
+						await handleGetWallet(userId, env, payload.response_url!);
+						break;
+					case 'fund_wallet':
+						await handleFundWallet(userId, env, payload.response_url!);
+						break;
+					case 'remove_wallet':
+						await handleRemoveWallet(userId, env, payload.response_url!);
+						break;
+				}
+
+				return new Response('', { status: 200 });
+			} catch (error) {
+				console.error('Error handling interaction:', error);
+				return new Response('', { status: 200 });
+			}
+		}
+
+		// Wallet Command (Slash command /wallet)
+		if (url.pathname === Routes.WALLET && request.method === 'POST') {
+			return new Response(JSON.stringify({
+				response_type: 'in_channel',
+				text: 'Manage your wallet',
+				blocks: [
+					{
+						type: 'section',
+						text: {
+							type: 'mrkdwn',
+							text: '👋 *Welcome to Wallet Manager*\n\nChoose an option below to get started:',
+						},
+					},
+					{
+						type: 'actions',
+						elements: createWalletButtons(false),
+					},
+				],
+			}), {
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}
+
+		// AI Interpret Test Endpoint
+		if (url.pathname === Routes.AI_INTERPRET && request.method === 'GET') {
+			const prompt = url.searchParams.get('prompt');
+			if (!prompt) {
+				return new Response(JSON.stringify({ error: 'Missing prompt parameter' }), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+
+			try {
+				const action = await interpretPrompt(prompt, env.OPENAI_API_KEY);
+				return new Response(JSON.stringify({ prompt, interpreted_action: action }), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			} catch (error) {
+				return new Response(JSON.stringify({
+					error: error instanceof Error ? error.message : 'Failed to interpret prompt',
+				}), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+		}
+
+		// Test Wallet Creation Endpoint
+		if (url.pathname === Routes.TEST_CREATE_WALLET && request.method === 'GET') {
+			try {
+				const wallet = await createWalletWithSDK(
+					env.COINBASE_API_KEY_NAME,
+					env.COINBASE_API_KEY_PRIVATE_KEY,
+					'base-sepolia'
+				);
+
+				return new Response(JSON.stringify({
+					success: true,
+					wallet: {
+						id: wallet.id,
+						network: wallet.network_id,
+						address: wallet.default_address.address_id,
+					},
+				}), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			} catch (error) {
+				console.error('Wallet creation test failed:', error);
+				return new Response(JSON.stringify({
+					success: false,
+					error: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				}), {
+					status: 500,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+		}
+
+		return new Response('Not Found', { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
